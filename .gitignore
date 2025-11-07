@@ -1,6 +1,7 @@
 target/
 queue.db
 queuectl_runtime/
+job_logs/
 .idea/
 .vscode/
 *.iml

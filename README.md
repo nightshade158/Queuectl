@@ -38,6 +38,11 @@ A unit of work defined by:
 - **state**: Current status (pending, processing, completed, failed, dead)
 - **attempts**: Number of times execution has been attempted
 - **max_retries**: Maximum retry attempts before moving to DLQ
+- **priority**: Higher values are processed first (default 0)
+- **run_at**: ISO timestamp when the job becomes eligible for execution (supports scheduling)
+- **timeout_seconds**: Hard execution timeout per attempt (0 = no limit / use config default)
+- **last_output_path**: File path capturing stdout/stderr for the most recent attempt
+- **run_count / success_count / failure_count**: Execution metrics maintained per job
 - **created_at/updated_at**: ISO 8601 timestamps
 
 ### **Worker**
@@ -60,6 +65,24 @@ A retry strategy where the delay between retries increases exponentially:
 - Formula: `delay = backoff_base ^ attempts` seconds
 - Example with `backoff_base=2`: 1st retry waits 2s, 2nd waits 4s, 3rd waits 8s
 - Prevents overwhelming systems with rapid retry attempts
+
+### **Job Priority**
+An integer that influences job scheduling order. Higher values are dequeued before lower-priority jobs when multiple jobs are ready at the same time.
+
+### **Scheduled Job (run_at)**
+Each job can specify a future `run_at` timestamp (or `delay_seconds` during enqueue). Workers ignore jobs whose `run_at` is in the future, enabling delayed execution and retry deferral without busy-wait sleeps.
+
+### **Job Timeout**
+Jobs can define `timeout_seconds` or fall back to `default_timeout_seconds` in `config.json`. If a command exceeds the timeout, it is forcefully terminated, marked as failure with exit code 124, and retried or moved to DLQ.
+
+### **Job Output Logging**
+Every attempt writes combined stdout/stderr to a log file under `job_logs/`. The latest path is tracked per job, retrievable via `queuectl logs <job_id>` and exposed through the dashboard API.
+
+### **Execution Metrics**
+Per-job and global metrics (run counts, success/failure totals, cumulative runtimes, average duration, last finished timestamp) are maintained in SQLite and exposed via `queuectl status` / `metrics`.
+
+### **Dashboard**
+A lightweight HTTP server (`queuectl dashboard start`) serving live JSON and HTML views of queue status, jobs, DLQ, and logs.
 
 ### **Atomic Locking**
 A database mechanism ensuring:
@@ -85,6 +108,7 @@ Project_java/
 ├── queuectl_runtime/                # Runtime directory (auto-generated)
 │   ├── STOP                         # Graceful shutdown flag
 │   └── worker-<pid>.pid             # Worker PID files
+├── job_logs/                        # Captured stdout/stderr per job attempt (auto-generated)
 ├── src/
 │   ├── main/
 │   │   └── java/com/queuectl/
@@ -94,16 +118,16 @@ Project_java/
 │   │       ├── Worker.java          # Worker process logic
 │   │       ├── QueueManager.java    # Queue orchestration
 │   │       ├── Dlq.java             # Dead Letter Queue operations
-│   │       └── Config.java          # Configuration management
+│   │       ├── Config.java          # Configuration management
+│   │       └── DashboardServer.java # Minimal monitoring web server
 │   └── test/
 │       └── java/com/queuectl/
 │           └── FlowTest.java        # JUnit test cases
 ├── scripts/
 │   ├── install.sh                   # Installation script
 │   ├── test_flow.sh                 # Integration test script
-│   └── clean_reset.sh               # Clean rebuild script
-├── bin/
-│   └── queuectl                     # Local wrapper script
+│   ├── clean_reset.sh               # Clean rebuild script
+│   └── demo_all_features.sh         # End-to-end demonstration script
 └── README.md                        # This file
 ```
 
@@ -117,12 +141,14 @@ Project_java/
 
 **Structure**:
 - `Models.Job` (static inner class): Represents a job with fields:
-  - `id`, `command`, `state`, `attempts`, `max_retries`, `created_at`, `updated_at`
+  - `id`, `command`, `state`, `attempts`, `max_retries`, `priority`, `run_at`, `timeout_seconds`, `last_exit_code`, `last_duration_ms`, `last_output_path`, `run_count`, `success_count`, `failure_count`, `total_runtime_ms`, `last_finished_at`, `created_at`, `updated_at`
 - `Models.nowIso()`: Returns current UTC time in ISO 8601 format
 
 **Key Features**:
 - Default state is "pending"
 - Default max_retries is 3
+- Default priority is 0, `run_at` seeded to now, and metrics counters initialise to 0
+- Optional timeout inherits from config if not specified
 - Timestamps auto-initialized on creation
 
 ---
@@ -147,52 +173,45 @@ Project_java/
 - Inserts new job or updates existing one (ON CONFLICT)
 - Used by enqueue operation
 
-#### `fetchAndLockNextPending()`
-**Critical Method** - Implements atomic job locking:
-1. Selects oldest pending job (ORDER BY created_at ASC)
-2. Atomically updates state to "processing" (WHERE state='pending')
-3. If update affects 1 row, job is locked; otherwise retry
-4. Includes retry logic for SQLITE_BUSY errors (up to 20 attempts)
-5. Returns locked Job or null if no jobs available
+#### `markJobSuccess(String id, int attempts, int exitCode, long durationMs, String outputPath)`
+- Marks job as completed, increments run/success counters, stores duration and exit code
+- Persists latest log path and last_finished_at timestamps
 
-**Concurrency Handling**:
-- Uses atomic UPDATE with WHERE condition to prevent race conditions
-- Retries on database lock errors with exponential backoff (50-100ms)
-- Multiple workers can safely poll simultaneously
+#### `markJobFailure(String id, int attempts, int exitCode, long durationMs, String outputPath, boolean willRetry)`
+- Records failed attempt metrics (run_count, failure_count, total_runtime)
+- Sets state to `failed` (if retry pending) or `dead` (terminal failure)
 
-#### `setCompleted(String id)`
-- Updates job state to "completed"
-- Updates timestamp
-
-#### `setFailed(String id, int attempts, String state)`
-- Updates job state and attempt count
-- Used for retryable failures
+#### `scheduleRetry(String id, String nextRunAt)`
+- Resets state to `pending`, updates `run_at` to future timestamp for exponential backoff scheduling
+- Allows workers to continue processing other jobs without sleeping
 
 #### `moveToDlq(String id)`
-- Transactionally moves job from `jobs` to `dead_letter_jobs` table
-- Sets state to "dead"
-- Deletes from main jobs table
+- Transactionally copies job + metrics/log path into `dead_letter_jobs`
+- Deletes original row from `jobs`, preserving audit information for DLQ inspection
 
 #### `listJobs(String state)`
-- Returns all jobs, optionally filtered by state
-- Ordered by creation time
+- Returns jobs ordered by priority DESC, run_at ASC, created_at ASC
+- When filtering by `dead`, QueueManager delegates to DLQ list for convenience
 
 #### `listDlq()`
-- Returns all jobs in dead_letter_jobs table
+- Returns all jobs in `dead_letter_jobs` ordered by creation time
 
 #### `retryFromDlq(String id)`
-- Moves job back from DLQ to main queue
-- Resets attempts to 0, state to "pending"
-- Returns true if successful, false if job not found
+- Moves job back from DLQ to main queue, resets attempts=0, state=`pending`, run_at=now
+- Preserves historical metrics for observability
 
 #### `counts()`
-- Returns `Storage.Counts` object with job counts per state
-- Used for status command
+- Aggregates state counts plus run/success/failure totals, total/average runtime, last_finished_at
+- Includes DLQ rows so long-lived failures are reflected in metrics
+- Used by status/metrics commands and dashboard APIs
 
 **Database Schema**:
 ```sql
-jobs: id (PK), command, state, attempts, max_retries, created_at, updated_at
-dead_letter_jobs: (same schema)
+jobs: id (PK), command, state, attempts, max_retries, priority, run_at, timeout_seconds,
+      last_exit_code, last_duration_ms, last_output_path, run_count, success_count,
+      failure_count, total_runtime_ms, last_finished_at, created_at, updated_at
+
+dead_letter_jobs: (same columns as jobs)
 ```
 
 ---
@@ -220,7 +239,7 @@ dead_letter_jobs: (same schema)
    - Captures exit code
 
 4. **Success Handling**:
-   - Exit code 0 → `Storage.setCompleted(job.id)`
+   - Exit code 0 → `Storage.markJobSuccess(job.id, job.attempts, exitCode, durationMs, logPath)`
 
 5. **Failure Handling**:
    - Exit code != 0 → increment attempts
@@ -345,7 +364,7 @@ dead_letter_jobs: (same schema)
 
 #### `load()`
 - Loads config.json or creates with defaults
-- Defaults: `max_retries=3`, `backoff_base=2`
+- Defaults: `max_retries=3`, `backoff_base=2`, `default_timeout_seconds=0`, `dashboard_port=8080`, `log_directory="job_logs"`
 - Merges missing keys with defaults
 
 #### `save(ObjectNode node)`
@@ -353,8 +372,8 @@ dead_letter_jobs: (same schema)
 
 #### `set(String key, String value)`
 - Updates configuration key
-- Validates key name (only max_retries, backoff_base allowed)
-- Converts value to integer if appropriate
+- Validates key name (`max_retries`, `backoff_base`, `default_timeout_seconds`, `dashboard_port`, `log_directory`)
+- Converts numeric values when appropriate
 - Saves updated config
 
 **Configuration File**: `config.json` (auto-created in project root)
@@ -371,45 +390,41 @@ dead_letter_jobs: (same schema)
    → Cli.Enqueue.run()
    → QueueManager.enqueue()
    → Storage.upsert()
-   → Job inserted with state="pending"
+   → Job inserted with state="pending", default priority=0, run_at=now
 
 2. WORKER POLLING
    Worker.run() loop:
    → Storage.fetchAndLockNextPending()
-     → SELECT oldest pending job
+     → SELECT job where state='pending' AND run_at <= now ORDER BY priority DESC, run_at ASC, created_at ASC
      → UPDATE state='processing' (atomic)
-     → Return Job object
-   → Worker.execute(job.command)
+     → Return Job object with metrics/log paths
+   → Worker.execute(job)
      → ProcessBuilder("bash", "-lc", command)
-     → Wait for exit code
+     → Redirect combined stdout/stderr to job_logs/<id>-attempt-<n>.log
+     → Wait for exit code, respecting per-job/default timeout
 
 3. SUCCESS PATH
    Exit code = 0
-   → Storage.setCompleted(job.id)
-   → State = "completed"
+   → Storage.markJobSuccess(id, attempts, exitCode, durationMs, logPath)
+   → Job state="completed", metrics (run_count, success_count, total_runtime_ms, last_finished_at) updated
 
 4. FAILURE PATH (Retryable)
    Exit code != 0
    → attempts++
-   → If attempts <= max_retries:
-     → Storage.setFailed(id, attempts, "failed")
-     → Calculate delay = backoff_base ^ attempts
-     → Thread.sleep(delay)
-     → Storage.setFailed(id, attempts, "pending")  # Requeue
-   → Worker continues polling
+   → Storage.markJobFailure(id, attempts, exitCode, durationMs, logPath, willRetry=true)
+   → Compute delaySeconds = max(1, backoff_base ^ attempts)
+   → Storage.scheduleRetry(id, run_at = now + delaySeconds)  // worker immediately continues polling other jobs
 
 5. FAILURE PATH (Exhausted)
-   Exit code != 0 AND attempts > max_retries
-   → Storage.moveToDlq(job.id)
-   → Job moved to dead_letter_jobs table
-   → State = "dead"
+   Exit code != 0 AND attempts >= max_retries
+   → Storage.markJobFailure(id, attempts, exitCode, durationMs, logPath, willRetry=false)
+   → Storage.moveToDlq(id)  // copies metrics/log reference into dead_letter_jobs and deletes main record
 
 6. DLQ RETRY
    User: queuectl dlq retry job1
    → Dlq.retry()
    → Storage.retryFromDlq()
-   → Job moved back to jobs table
-   → State = "pending", attempts = 0
+   → Job moved back to jobs table with attempts reset, run_at=now, state="pending"
 ```
 
 ### **Concurrency & Locking**
@@ -437,16 +452,10 @@ WHERE id IN (SELECT id FROM jobs WHERE id=? AND state='pending')
 ### **Exponential Backoff Calculation**
 
 ```java
-long delay = (long) Math.pow(backoff_base, attempts) * 1000L;
+long delaySeconds = Math.max(1L, Math.round(Math.pow(backoffBase, attempts)));
 ```
 
-**Example with backoff_base=2**:
-- 1st retry: 2^1 = 2 seconds
-- 2nd retry: 2^2 = 4 seconds
-- 3rd retry: 2^3 = 8 seconds
-- 4th retry: 2^4 = 16 seconds
-
-**Rationale**: Prevents overwhelming systems with rapid retries while giving transient issues time to resolve.
+**Rationale**: Workers reschedule the job's `run_at` instead of sleeping, giving other jobs a chance to run while transient issues recover.
 
 ### **Graceful Shutdown Mechanism**
 
@@ -463,409 +472,4 @@ long delay = (long) Math.pow(backoff_base, attempts) * 1000L;
    - Loop checks `shouldStop` after each job
    - Exits only after completing current job
 
-4. **PID File Cleanup**: Deleted in `finally` block
-
----
-
-## Setup & Installation
-
-### **Prerequisites**
-
-- **Java 17+**: Required for compilation and execution
-  - Check: `java -version`
-  - Install: `sudo apt install openjdk-17-jdk` (Ubuntu/Debian)
-
-- **Maven 3.9+**: Build tool
-  - Check: `mvn -version`
-  - Install: `sudo apt install maven` (Ubuntu/Debian)
-
-- **Bash**: Required for command execution (standard on Linux/macOS)
-
-### **Build Process**
-
-1. **Clone/Navigate to Project**:
-   ```bash
-   cd Project_java
-   ```
-
-2. **Build JAR**:
-   ```bash
-   mvn -q -DskipTests package
-   ```
-   - Compiles Java source files
-   - Downloads dependencies (picocli, sqlite-jdbc, jackson, slf4j)
-   - Creates `target/queuectl-0.1.0-jar-with-dependencies.jar`
-
-3. **Install Command** (Optional):
-   ```bash
-   bash scripts/install.sh
-   ```
-   - Builds project
-   - Installs `queuectl` to `/usr/local/bin` or `~/.local/bin`
-   - Adds to PATH if needed
-
-### **Dependencies (from pom.xml)**
-
-- **picocli 4.7.5**: CLI framework
-- **sqlite-jdbc 3.46.0.0**: SQLite database driver
-- **jackson-databind 2.17.1**: JSON parsing
-- **slf4j-simple 2.0.13**: Logging (suppresses warnings)
-- **junit-jupiter 5.10.2**: Testing (test scope)
-
-### **Auto-Generated Files**
-
-- `config.json`: Created on first run with defaults
-- `queue.db`: SQLite database created on first use
-- `queuectl_runtime/`: Runtime directory created by workers
-
----
-
-## CLI Usage Guide
-
-### **Basic Operations**
-
-#### **1. Enqueue a Job**
-```bash
-queuectl enqueue '{"id":"job1","command":"echo Hello World"}'
-```
-- **Required fields**: `id`, `command`
-- **Optional fields**: `max_retries`, `attempts`, `state`
-- **Default max_retries**: From config.json (default: 3)
-
-**Example with all fields**:
-```bash
-queuectl enqueue '{"id":"task1","command":"sleep 5","max_retries":5,"state":"pending"}'
-```
-
-#### **2. Start Workers**
-```bash
-queuectl worker start --count 3
-```
-- Spawns 3 worker processes
-- Each worker runs in separate JVM
-- Workers poll continuously for jobs
-
-#### **3. Check Status**
-```bash
-queuectl status
-```
-**Output**:
-```json
-{
-  "pending": 2,
-  "processing": 1,
-  "completed": 10,
-  "failed": 0,
-  "dead": 1,
-  "active_workers": 3
-}
-```
-
-#### **4. List Jobs**
-```bash
-queuectl list                    # All jobs
-queuectl list --state pending    # Only pending jobs
-queuectl list --state completed  # Only completed jobs
-```
-
-**Output**:
-```json
-[
-  {
-    "id": "job1",
-    "command": "echo hi",
-    "state": "completed",
-    "attempts": 0,
-    "max_retries": 3,
-    "created_at": "2025-11-06T10:00:00Z",
-    "updated_at": "2025-11-06T10:00:05Z"
-  }
-]
-```
-
-#### **5. Dead Letter Queue**
-```bash
-queuectl dlq list              # List all DLQ jobs
-queuectl dlq retry job1         # Retry a DLQ job
-```
-
-#### **6. Configuration**
-```bash
-queuectl config get             # Show current config
-queuectl config set max_retries 5
-queuectl config set backoff_base 3
-```
-
-#### **7. Stop Workers**
-```bash
-queuectl worker stop
-```
-- Creates STOP file
-- Workers finish current job and exit
-- May take a few seconds if jobs are running
-
-### **Advanced Usage**
-
-#### **Complex Commands**
-```bash
-# Multi-line command
-queuectl enqueue '{"id":"build","command":"cd /tmp && make && ./test"}'
-
-# Command with arguments
-queuectl enqueue '{"id":"backup","command":"tar -czf backup.tar.gz /home/user"}'
-```
-
-#### **Monitoring Workflow**
-```bash
-# Start workers
-queuectl worker start --count 2
-
-# Enqueue jobs
-queuectl enqueue '{"id":"job1","command":"sleep 2"}'
-queuectl enqueue '{"id":"job2","command":"echo done"}'
-
-# Monitor status
-watch -n 1 'queuectl status'
-
-# Check specific state
-queuectl list --state processing
-```
-
----
-
-## Output Analysis
-
-### **Status Command Output**
-
-```json
-{
-  "pending": 5,        # Jobs waiting to be processed
-  "processing": 2,      # Jobs currently being executed
-  "completed": 100,    # Successfully completed jobs
-  "failed": 1,         # Jobs in retry state (will retry)
-  "dead": 3,          # Jobs moved to DLQ (exhausted retries)
-  "active_workers": 2  # Number of running worker processes
-}
-```
-
-**Interpretation**:
-- **High pending**: Workers may be slow or insufficient
-- **High processing**: Normal if jobs take time
-- **High failed**: Check job commands for issues
-- **High dead**: Review DLQ for problematic jobs
-- **active_workers=0**: No workers running (start with `worker start`)
-
-### **List Command Output**
-
-**Job States**:
-- `pending`: Waiting for worker
-- `processing`: Currently executing
-- `completed`: Successfully finished
-- `failed`: Failed but retryable (attempts < max_retries)
-- `dead`: Moved to DLQ (attempts >= max_retries)
-
-**Key Fields**:
-- `attempts`: Number of execution attempts
-- `max_retries`: Maximum allowed retries
-- `created_at`: When job was enqueued
-- `updated_at`: Last state change time
-
-### **DLQ List Output**
-
-Shows jobs that have exhausted retries. Common reasons:
-- Invalid command (command not found)
-- Persistent failure (network issues, missing files)
-- Permission errors
-
-**Action**: Review commands, fix issues, then retry with `dlq retry <id>`.
-
-### **Error Messages**
-
-- **"Invalid JSON"**: Malformed JSON in enqueue command
-- **"id and command required"**: Missing required fields
-- **"Job not found in DLQ"**: Job ID doesn't exist in DLQ
-- **"Unknown config key"**: Invalid config key name
-- **SQLITE_BUSY**: Database locked (usually transient, retries automatically)
-
----
-
-## Testing & Validation
-
-### **Manual Testing**
-
-1. **Basic Flow**:
-   ```bash
-   queuectl enqueue '{"id":"test1","command":"echo success"}'
-   queuectl worker start --count 1
-   sleep 2
-   queuectl status  # Should show completed=1
-   queuectl worker stop
-   ```
-
-2. **Retry Flow**:
-   ```bash
-   queuectl enqueue '{"id":"fail1","command":"bash -c \"exit 1\"","max_retries":2}'
-   queuectl worker start --count 1
-   sleep 10  # Wait for retries
-   queuectl status  # Should show failed or dead
-   queuectl dlq list  # Check if moved to DLQ
-   ```
-
-3. **Concurrent Workers**:
-   ```bash
-   queuectl enqueue '{"id":"job1","command":"sleep 2"}'
-   queuectl enqueue '{"id":"job2","command":"sleep 2"}'
-   queuectl enqueue '{"id":"job3","command":"sleep 2"}'
-   queuectl worker start --count 3
-   sleep 5
-   queuectl status  # Should show 3 jobs completed
-   ```
-
-### **Automated Testing**
-
-**Integration Test Script**:
-```bash
-bash scripts/test_flow.sh
-```
-
-**What it tests**:
-1. Enqueue successful job
-2. Start worker
-3. Verify completion
-4. Enqueue failing job
-5. Verify DLQ movement
-6. Retry from DLQ
-
-**JUnit Tests**:
-```bash
-mvn test
-```
-
-Runs `FlowTest.java` which validates storage operations.
-
-### **Clean Reset**
-
-To reset everything for fresh testing:
-```bash
-bash scripts/clean_reset.sh
-```
-
-This script:
-- Stops all workers
-- Removes database
-- Cleans Maven build
-- Rebuilds project
-- Runs tests
-
----
-
-## Troubleshooting
-
-### **Workers Not Processing Jobs**
-
-**Symptoms**: `pending` count stays high, `active_workers=0`
-
-**Solutions**:
-1. Check if workers are running: `queuectl status`
-2. Start workers: `queuectl worker start --count 2`
-3. Check for STOP file: `ls queuectl_runtime/STOP` (delete if exists)
-4. Verify database exists: `ls queue.db`
-
-### **Jobs Stuck in Processing**
-
-**Symptoms**: Jobs remain in "processing" state
-
-**Causes**:
-- Worker crashed mid-execution
-- Long-running command
-
-**Solutions**:
-1. Check worker processes: `ps aux | grep queuectl`
-2. Restart workers: `queuectl worker stop && queuectl worker start --count 2`
-3. Manually update state (if needed): Direct SQLite access
-
-### **Database Lock Errors**
-
-**Symptoms**: `SQLITE_BUSY` errors in logs
-
-**Solutions**:
-- Usually transient - system retries automatically
-- If persistent: Reduce number of workers
-- Check for stale connections: Restart workers
-
-### **Commands Not Executing**
-
-**Symptoms**: Jobs fail immediately with exit code 127
-
-**Causes**:
-- Command not found
-- Invalid shell syntax
-
-**Solutions**:
-1. Test command manually: `bash -lc "your-command"`
-2. Use full paths: `/usr/bin/echo` instead of `echo`
-3. Check permissions: Ensure command is executable
-
-### **DLQ Growing Rapidly**
-
-**Symptoms**: Many jobs in DLQ
-
-**Solutions**:
-1. Review DLQ jobs: `queuectl dlq list`
-2. Check job commands for issues
-3. Increase `max_retries` in config
-4. Fix underlying issues (network, permissions, etc.)
-5. Retry fixed jobs: `queuectl dlq retry <id>`
-
-### **Performance Issues**
-
-**Symptoms**: Slow job processing
-
-**Optimizations**:
-1. Increase worker count: `queuectl worker start --count 5`
-2. Check database size: `ls -lh queue.db`
-3. Clean old completed jobs (manual SQLite cleanup)
-4. Monitor system resources: `top`, `htop`
-
----
-
-## Latest Changes & Improvements
-
-### **Concurrency Improvements**
-- **Atomic Job Locking**: Implemented atomic UPDATE with WHERE condition to prevent duplicate processing
-- **SQLITE_BUSY Handling**: Added retry logic with exponential backoff for database lock errors
-- **WAL Mode**: Enabled Write-Ahead Logging for better concurrent read performance
-
-### **Error Handling**
-- **SLF4J Binding**: Added slf4j-simple to eliminate logging warnings
-- **Graceful Degradation**: Workers handle missing jobs, invalid commands gracefully
-
-### **Installation**
-- **Auto-Install Script**: `scripts/install.sh` automatically installs queuectl command
-- **Portable Scripts**: All scripts use relative paths for portability
-
-### **Documentation**
-- **Comprehensive README**: Complete technical documentation
-- **Code Comments**: Inline documentation for complex logic
-
----
-
-## License
-
-MIT License - See LICENSE file for details.
-
----
-
-## Contributing
-
-This is an internship assignment project. For production use, consider:
-- Job priority queues
-- Scheduled/delayed jobs (run_at timestamps)
-- Job output logging
-- Metrics and monitoring
-- Web dashboard
-- Job timeout handling
-
----
-
-**End of Documentation**
+4. **PID File Cleanup**: Deleted in `

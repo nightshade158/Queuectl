@@ -15,14 +15,20 @@ public class Config {
         ObjectNode defaults = MAPPER.createObjectNode();
         defaults.put("max_retries", 3);
         defaults.put("backoff_base", 2);
+        defaults.put("default_timeout_seconds", 0);
+        defaults.put("dashboard_port", 8080);
+        defaults.put("log_directory", "job_logs");
         if (!CONFIG_FILE.exists()) {
             save(defaults);
             return defaults;
         }
         try {
             ObjectNode current = (ObjectNode) MAPPER.readTree(CONFIG_FILE);
-            if (!current.has("max_retries")) current.put("max_retries", 3);
-            if (!current.has("backoff_base")) current.put("backoff_base", 2);
+        if (!current.has("max_retries")) current.put("max_retries", 3);
+        if (!current.has("backoff_base")) current.put("backoff_base", 2);
+        if (!current.has("default_timeout_seconds")) current.put("default_timeout_seconds", 0);
+        if (!current.has("dashboard_port")) current.put("dashboard_port", 8080);
+        if (!current.has("log_directory")) current.put("log_directory", "job_logs");
             return current;
         } catch (IOException e) {
             return defaults;
@@ -39,7 +45,11 @@ public class Config {
 
     public static ObjectNode set(String key, String value) {
         ObjectNode cfg = load();
-        if (!Objects.equals(key, "max_retries") && !Objects.equals(key, "backoff_base")) {
+        if (!Objects.equals(key, "max_retries") &&
+            !Objects.equals(key, "backoff_base") &&
+            !Objects.equals(key, "default_timeout_seconds") &&
+            !Objects.equals(key, "dashboard_port") &&
+            !Objects.equals(key, "log_directory")) {
             throw new IllegalArgumentException("Unknown config key: " + key);
         }
         try {
