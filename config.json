@@ -1,7 +1,7 @@
 {
-  "backoff_base" : 2,
+  "backoff_base" : 3,
   "dashboard_port" : 8080,
   "default_timeout_seconds" : 0,
   "log_directory" : "job_logs",
-  "max_retries" : 3
+  "max_retries" : 5
 }

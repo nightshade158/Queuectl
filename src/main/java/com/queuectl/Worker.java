@@ -1,7 +1,6 @@
 package com.queuectl;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.queuectl.Models;
 import com.queuectl.Models.Job;
 
 import java.io.File;
@@ -103,13 +102,11 @@ public class Worker {
     private static class ExecutionResult {
         final int exitCode;
         final long durationMs;
-        final boolean timedOut;
         final String logPath;
 
         ExecutionResult(int exitCode, long durationMs, boolean timedOut, String logPath) {
             this.exitCode = exitCode;
             this.durationMs = durationMs;
-            this.timedOut = timedOut;
             this.logPath = logPath;
         }
     }

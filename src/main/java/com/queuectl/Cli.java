@@ -2,7 +2,6 @@ package com.queuectl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.queuectl.Models;
 import com.queuectl.Models.Job;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
